@@ -1,0 +1,10 @@
+{
+  "name": "jkt48-push-server",
+  "version": "1.0.0",
+  "description": "JKT48Connect Push Notification Backend untuk Vercel",
+  "private": true,
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "expo-server-sdk": "^3.10.0"
+  }
+}
