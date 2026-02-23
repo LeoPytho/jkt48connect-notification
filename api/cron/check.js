@@ -1,6 +1,6 @@
 "use strict";
 
-const { getLiveStreams, getNews, getTheater, getBirthdays } = require("../../lib/jkt48api");
+const { getLiveStreams, getLatestNews, getLatestTheater, getBirthdays } = require("../../lib/jkt48api");
 const { sendPushToAll } = require("../../lib/push");
 const { getAllTokens, hasInCache, addToCache, removeFromCache, getAllFromCache } = require("../../lib/storage");
 
@@ -40,11 +40,13 @@ module.exports = function handler(req, res) {
   });
 };
 
+// ── LIVE — kirim semua yang sedang live, bersihkan yang sudah offline ──────────
 function checkLive(tokens) {
   return getLiveStreams().then(function(streams) {
     var activeIds = new Set(streams.map(function(s) { return String(s.chat_room_id); }));
     var sent = 0;
     var chain = Promise.resolve();
+
     streams.forEach(function(stream) {
       chain = chain.then(function() {
         var id = String(stream.chat_room_id);
@@ -62,6 +64,7 @@ function checkLive(tokens) {
         });
       });
     });
+
     return chain.then(function() {
       return getAllFromCache("live").then(function(cached) {
         var cleared = 0;
@@ -79,10 +82,12 @@ function checkLive(tokens) {
   });
 }
 
+// ── NEWS — hanya item terbaru (index 0) ───────────────────────────────────────
 function checkNews(tokens) {
-  return getNews().then(function(list) {
+  return getLatestNews().then(function(list) {
     var sent = 0;
     var chain = Promise.resolve();
+
     list.forEach(function(item) {
       chain = chain.then(function() {
         var id = item._id || item.id;
@@ -97,14 +102,17 @@ function checkNews(tokens) {
         });
       });
     });
+
     return chain.then(function() { return { sent: sent }; });
   });
 }
 
+// ── THEATER — hanya item terbaru (index 0) ────────────────────────────────────
 function checkTheater(tokens) {
-  return getTheater().then(function(list) {
+  return getLatestTheater().then(function(list) {
     var sent = 0;
     var chain = Promise.resolve();
+
     list.forEach(function(show) {
       chain = chain.then(function() {
         var id = String(show.id);
@@ -124,14 +132,17 @@ function checkTheater(tokens) {
         });
       });
     });
+
     return chain.then(function() { return { sent: sent }; });
   });
 }
 
+// ── BIRTHDAY ──────────────────────────────────────────────────────────────────
 function checkBirthday(tokens) {
   return getBirthdays().then(function(members) {
     var sent = 0;
     var chain = Promise.resolve();
+
     members.forEach(function(m) {
       chain = chain.then(function() {
         var url_key = m.url_key;
@@ -178,6 +189,7 @@ function checkBirthday(tokens) {
         return p;
       });
     });
+
     return chain.then(function() { return { sent: sent }; });
   });
 }
