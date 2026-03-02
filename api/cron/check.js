@@ -1,6 +1,6 @@
 "use strict";
 
-const { getLiveStreams, getLatestNews, getLatestTheater, getBirthdays } = require("../../lib/jkt48api");
+const { getLiveStreams, getLatestNews, getLatestTheater, getBirthdays, getStreamCacheId } = require("../../lib/jkt48api");
 const { sendPushToAll } = require("../../lib/push");
 const {
   getAllTokens,
@@ -15,7 +15,7 @@ module.exports = function handler(req, res) {
   var start = Date.now();
   console.log("[CRON] start " + new Date().toISOString());
 
-  return getAllTokens().then(function(tokens) {
+  return getAllTokens().then(function (tokens) {
     console.log("[CRON] tokens: " + tokens.length);
 
     if (tokens.length === 0) {
@@ -27,7 +27,7 @@ module.exports = function handler(req, res) {
       checkNews(tokens),
       checkTheater(tokens),
       checkBirthday(tokens),
-    ]).then(function(results) {
+    ]).then(function (results) {
       var r = {
         ok: true,
         ms: Date.now() - start,
@@ -39,57 +39,82 @@ module.exports = function handler(req, res) {
       console.log("[CRON] done " + r.ms + "ms");
       return res.json(r);
     });
-  }).catch(function(err) {
+  }).catch(function (err) {
     console.error("[CRON] fatal:", err.message);
     return res.status(500).json({ error: err.message });
   });
 };
 
 // ── LIVE ──────────────────────────────────────────────────────────────────────
-// Cache permanent tanpa TTL.
-// Selama stream ada di API → cache ada → notif tidak dikirim ulang.
-// Saat stream tidak ada di API lagi → cache dihapus otomatis.
+// Mendukung IDN (punya chat_room_id) dan Showroom (punya room_id).
+// Cache key menggunakan getStreamCacheId() agar unik di semua tipe.
 function checkLive(tokens) {
-  return getLiveStreams().then(function(streams) {
-    var activeIds = new Set(streams.map(function(s) { return String(s.chat_room_id); }));
+  return getLiveStreams().then(function (streams) {
+    // Kumpulkan semua cache ID yang aktif sekarang
+    var activeIds = new Set(streams.map(function (s) { return getStreamCacheId(s); }));
     var sent = 0;
     var chain = Promise.resolve();
 
-    streams.forEach(function(stream) {
-      chain = chain.then(function() {
-        var id = String(stream.chat_room_id);
-        return tryAcquireCache("live", id).then(function(acquired) {
-          if (!acquired) return;
-          var tipe = (stream.type || "IDN").toUpperCase();
+    streams.forEach(function (stream) {
+      chain = chain.then(function () {
+        var cacheId = getStreamCacheId(stream);
+        var type    = (stream.type || "idn").toLowerCase();
+
+        return tryAcquireCache("live", cacheId).then(function (acquired) {
+          if (!acquired) return; // sudah pernah notif, skip
+
+          var tipe  = type === "showroom" ? "Showroom" : "IDN";
           var mulai = stream.started_at
-            ? new Date(stream.started_at).toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Jakarta" })
+            ? new Date(stream.started_at).toLocaleTimeString("id-ID", {
+                hour: "2-digit",
+                minute: "2-digit",
+                timeZone: "Asia/Jakarta",
+              })
             : "";
+
+          // Payload notifikasi — sertakan field yang relevan per tipe
+          var notifData = {
+            type:    "live",
+            stream_type: type,               // "idn" | "showroom"
+            url_key: stream.url_key || "",
+            slug:    stream.slug    || "",
+            room_id: String(stream.room_id    || ""),
+            chat_room_id: String(stream.chat_room_id || ""),
+          };
+
+          console.log(
+            "[CRON] Live baru terdeteksi: " + stream.name +
+            " [" + tipe + "] cacheId=" + cacheId
+          );
+
           return sendPushToAll(tokens, {
-            title: stream.name + " sedang LIVE!",
-            body: tipe + " Live" + (mulai ? " - Mulai " + mulai + " WIB" : "") + " - Ketuk untuk nonton!",
-            data: { type: "live", room_id: stream.chat_room_id, url_key: stream.url_key, slug: stream.slug },
+            title:     stream.name + " sedang LIVE!",
+            body:      tipe + " Live" + (mulai ? " · Mulai " + mulai + " WIB" : "") + " · Ketuk untuk nonton!",
+            data:      notifData,
             channelId: "jkt48-live",
-          }).then(function() { sent++; });
+          }).then(function () { sent++; });
         });
       });
     });
 
-    return chain.then(function() {
-      // Auto-delete cache stream yang sudah offline (tidak ada di API)
-      return getAllFromCache("live").then(function(cached) {
-        var cleared = 0;
+    return chain.then(function () {
+      // Hapus cache untuk stream yang sudah offline
+      return getAllFromCache("live").then(function (cached) {
+        var cleared    = 0;
         var cleanChain = Promise.resolve();
-        cached.forEach(function(id) {
+
+        cached.forEach(function (id) {
           if (!activeIds.has(id)) {
-            cleanChain = cleanChain.then(function() {
-              return removeFromCache("live", id).then(function() {
+            cleanChain = cleanChain.then(function () {
+              return removeFromCache("live", id).then(function () {
                 cleared++;
                 console.log("[CRON] Live offline, cache dihapus: " + id);
               });
             });
           }
         });
-        return cleanChain.then(function() {
+
+        return cleanChain.then(function () {
           return { sent: sent, active: activeIds.size, cleared: cleared };
         });
       });
@@ -98,107 +123,107 @@ function checkLive(tokens) {
 }
 
 // ── NEWS ──────────────────────────────────────────────────────────────────────
-// Cache permanent — ID berita selalu unik, tidak akan spam.
 function checkNews(tokens) {
-  return getLatestNews().then(function(list) {
-    var sent = 0;
+  return getLatestNews().then(function (list) {
+    var sent  = 0;
     var chain = Promise.resolve();
 
-    list.forEach(function(item) {
-      chain = chain.then(function() {
+    list.forEach(function (item) {
+      chain = chain.then(function () {
         var id = item._id || item.id;
         if (!id) return;
-        return tryAcquireCache("news", id).then(function(acquired) {
+        return tryAcquireCache("news", id).then(function (acquired) {
           if (!acquired) return;
           return sendPushToAll(tokens, {
-            title: "Berita Terbaru JKT48",
-            body: item.title || "Ada berita baru dari JKT48!",
-            data: { type: "news", news_id: item.id, mongo_id: item._id, date: item.date },
+            title:     "Berita Terbaru JKT48",
+            body:      item.title || "Ada berita baru dari JKT48!",
+            data:      { type: "news", news_id: item.id, mongo_id: item._id, date: item.date },
             channelId: "jkt48-notifications",
-          }).then(function() { sent++; });
+          }).then(function () { sent++; });
         });
       });
     });
 
-    return chain.then(function() { return { sent: sent }; });
+    return chain.then(function () { return { sent: sent }; });
   });
 }
 
 // ── THEATER ───────────────────────────────────────────────────────────────────
-// Cache permanent — ID show selalu unik, tidak akan spam.
 function checkTheater(tokens) {
-  return getLatestTheater().then(function(list) {
-    var sent = 0;
+  return getLatestTheater().then(function (list) {
+    var sent  = 0;
     var chain = Promise.resolve();
 
-    list.forEach(function(show) {
-      chain = chain.then(function() {
+    list.forEach(function (show) {
+      chain = chain.then(function () {
         var id = String(show.id);
-        return tryAcquireCache("theater", id).then(function(acquired) {
+        return tryAcquireCache("theater", id).then(function (acquired) {
           if (!acquired) return;
           var tgl = show.date
-            ? new Date(show.date).toLocaleString("id-ID", { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "Asia/Jakarta" })
+            ? new Date(show.date).toLocaleString("id-ID", {
+                day: "numeric", month: "short", year: "numeric",
+                hour: "2-digit", minute: "2-digit",
+                timeZone: "Asia/Jakarta",
+              })
             : "";
-          var seitansai = (show.seitansai && show.seitansai.length)
-            ? " - Seitansai: " + show.seitansai.map(function(s) { return s.name; }).join(", ")
+          var seitansai = show.seitansai && show.seitansai.length
+            ? " · Seitansai: " + show.seitansai.map(function (s) { return s.name; }).join(", ")
             : "";
           return sendPushToAll(tokens, {
-            title: show.title,
-            body: tgl + " WIB - " + show.member_count + " member" + seitansai,
-            data: { type: "theater", theater_id: show.id, url: show.url, seitansai: show.seitansai || [] },
+            title:     show.title,
+            body:      tgl + " WIB · " + show.member_count + " member" + seitansai,
+            data:      { type: "theater", theater_id: show.id, url: show.url, seitansai: show.seitansai || [] },
             channelId: "jkt48-notifications",
-          }).then(function() { sent++; });
+          }).then(function () { sent++; });
         });
       });
     });
 
-    return chain.then(function() { return { sent: sent }; });
+    return chain.then(function () { return { sent: sent }; });
   });
 }
 
 // ── BIRTHDAY ──────────────────────────────────────────────────────────────────
-// Cache permanent — key sudah include tanggal/hari sehingga tidak akan spam.
 function checkBirthday(tokens) {
-  return getBirthdays().then(function(members) {
-    var sent = 0;
+  return getBirthdays().then(function (members) {
+    var sent  = 0;
     var chain = Promise.resolve();
 
-    members.forEach(function(m) {
-      chain = chain.then(function() {
-        var url_key = m.url_key;
-        var name = m.name;
-        var age = m.age_after_birthday;
+    members.forEach(function (m) {
+      chain = chain.then(function () {
+        var url_key  = m.url_key;
+        var name     = m.name;
+        var age      = m.age_after_birthday;
         var daysLeft = (m.next_birthday_countdown && m.next_birthday_countdown.days) || 0;
-        var p = Promise.resolve();
+        var p        = Promise.resolve();
 
         if (m.is_birthday_today) {
           var todayKey = url_key + "-today";
-          p = p.then(function() {
-            return tryAcquireCache("birthday", todayKey).then(function(acquired) {
+          p = p.then(function () {
+            return tryAcquireCache("birthday", todayKey).then(function (acquired) {
               if (!acquired) return;
               return sendPushToAll(tokens, {
-                title: "Selamat Ulang Tahun " + name + "!",
-                body: name + " JKT48 hari ini berulang tahun ke-" + age + "! Kirimkan ucapanmu!",
-                data: { type: "birthday", url_key: url_key, subtype: "today", age: age },
+                title:     "Selamat Ulang Tahun " + name + "!",
+                body:      name + " JKT48 hari ini berulang tahun ke-" + age + "! Kirimkan ucapanmu!",
+                data:      { type: "birthday", url_key: url_key, subtype: "today", age: age },
                 channelId: "jkt48-notifications",
-              }).then(function() { sent++; });
+              }).then(function () { sent++; });
             });
           });
         }
 
         if (daysLeft > 0 && daysLeft <= BIRTHDAY_REMINDER_DAYS) {
-          // Key sudah include daysLeft — tiap hari reminder punya key beda
           var rKey = url_key + "-reminder-" + daysLeft;
-          p = p.then(function() {
-            return tryAcquireCache("birthday", rKey).then(function(acquired) {
+          p = p.then(function () {
+            return tryAcquireCache("birthday", rKey).then(function (acquired) {
               if (!acquired) return;
               var countdown = daysLeft === 1 ? "Besok ulang tahun!" : daysLeft + " hari lagi ulang tahun!";
               return sendPushToAll(tokens, {
-                title: name + " - " + countdown,
-                body: name + " akan berulang tahun ke-" + age + " dalam " + daysLeft + " hari. Siapkan ucapanmu!",
-                data: { type: "birthday", url_key: url_key, subtype: "reminder", days_left: daysLeft, age: age },
+                title:     name + " - " + countdown,
+                body:      name + " akan berulang tahun ke-" + age + " dalam " + daysLeft + " hari. Siapkan ucapanmu!",
+                data:      { type: "birthday", url_key: url_key, subtype: "reminder", days_left: daysLeft, age: age },
                 channelId: "jkt48-notifications",
-              }).then(function() { sent++; });
+              }).then(function () { sent++; });
             });
           });
         }
@@ -207,6 +232,6 @@ function checkBirthday(tokens) {
       });
     });
 
-    return chain.then(function() { return { sent: sent }; });
+    return chain.then(function () { return { sent: sent }; });
   });
 }
